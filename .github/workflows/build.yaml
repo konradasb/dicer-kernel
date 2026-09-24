@@ -1,0 +1,90 @@
+# Copyright 2026 Dicer Authors
+# SPDX-License-Identifier: MIT
+
+---
+name: build
+
+# Every push and pull request builds the kernel for both architectures. A tag,
+# v6.18.53-1, also publishes the build as a release. See README.md.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential flex libelf-dev libssl-dev
+
+      - name: Build
+        run: ./build.sh ${{ matrix.arch }} out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # To create the release and upload to it.
+      contents: write
+      # To sign the checksums with cosign, keyless, as this workflow.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      # The kernel is GPL-2.0: each release carries the exact source it was
+      # built from, beside the binaries.
+      - name: Add the kernel's source
+        run: |
+          source kernel.env
+          major=${LINUX_VERSION%%.*}
+          curl -fsSL -o "out/linux-$LINUX_VERSION.tar.xz" \
+            "https://cdn.kernel.org/pub/linux/kernel/v$major.x/linux-$LINUX_VERSION.tar.xz"
+          echo "$LINUX_SHA256  out/linux-$LINUX_VERSION.tar.xz" | sha256sum --check
+          cp dicer.config configs/ch-*.config out/
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Checksum and sign
+        working-directory: out
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source kernel.env
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --title "Linux $LINUX_VERSION for Dicer (${GITHUB_REF_NAME##*-})" \
+            --notes "Linux $LINUX_VERSION from kernel.org, configured with Cloud Hypervisor's configuration and [dicer.config](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/dicer.config). The kernel's source is attached. Verify the downloads against SHA256SUMS, and SHA256SUMS with cosign; see the README."
